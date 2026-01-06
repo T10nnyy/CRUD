@@ -1,90 +1,40 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
-from bson import ObjectId
-from typing import Optional, List
-import os
 from contextlib import asynccontextmanager
+from typing import List
 
-# Pydantic models
-class PyObjectId(ObjectId):
-    @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, v):
-        if not ObjectId.is_valid(v):
-            raise ValueError("Invalid ObjectId")
-        return ObjectId(v)
-
-    @classmethod
-    def __get_pydantic_json_schema__(cls, field_schema):
-        field_schema.update(type="string")
-
-
-class ItemBase(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100)
-    description: Optional[str] = Field(None, max_length=500)
-    price: float = Field(..., gt=0)
-    quantity: int = Field(..., ge=0)
-
-
-class ItemCreate(ItemBase):
-    pass
-
-
-class ItemUpdate(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=100)
-    description: Optional[str] = Field(None, max_length=500)
-    price: Optional[float] = Field(None, gt=0)
-    quantity: Optional[int] = Field(None, ge=0)
-
-
-class ItemResponse(ItemBase):
-    id: str = Field(alias="_id")
-
-    class Config:
-        populate_by_name = True
-        json_encoders = {ObjectId: str}
-
-
-# Database connection
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-DATABASE_NAME = "fastapi_db"
-COLLECTION_NAME = "items"
-
-db_client: Optional[AsyncIOMotorClient] = None
+from database import Database, get_collection
+from models import ItemCreate, ItemUpdate, ItemResponse
+from schemas import (
+    ItemListResponseSchema,
+    MessageResponseSchema,
+    HealthCheckSchema,
+    ItemResponseSchema
+)
+from crud import CRUDOperations
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Manage application lifespan"""
     # Startup
-    global db_client
-    db_client = AsyncIOMotorClient(MONGODB_URL)
-    try:
-        await db_client.admin.command('ping')
-        print("Connected to MongoDB successfully!")
-    except Exception as e:
-        print(f"Failed to connect to MongoDB: {e}")
+    await Database.connect_db()
     
     yield
     
     # Shutdown
-    if db_client:
-        db_client.close()
-        print("MongoDB connection closed")
+    await Database.close_db()
 
 
-# FastAPI app
+# Initialize FastAPI app
 app = FastAPI(
-    title="FastAPI MongoDB CRUD",
-    description="Simple CRUD API with FastAPI and MongoDB",
-    version="1.0.0",
+    title="FastAPI MongoDB CRUD API",
+    description="Complete CRUD API with FastAPI and MongoDB (Modular Structure)",
+    version="2.0.0",
     lifespan=lifespan
 )
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -94,53 +44,118 @@ app.add_middleware(
 )
 
 
-def get_collection():
-    return db_client[DATABASE_NAME][COLLECTION_NAME]
-
-
-@app.get("/", tags=["Root"])
+@app.get("/", response_model=MessageResponseSchema, tags=["Root"])
 async def root():
+    """Root endpoint"""
     return {"message": "Welcome to FastAPI MongoDB CRUD API"}
 
 
-@app.post("/items/", response_model=ItemResponse, status_code=status.HTTP_201_CREATED, tags=["Items"])
+@app.get("/health", response_model=HealthCheckSchema, tags=["Health"])
+async def health_check():
+    """Check API and database health"""
+    try:
+        database = Database.get_database()
+        await database.client.admin.command('ping')
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "message": "All systems operational"
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database connection failed: {str(e)}"
+        )
+
+
+@app.post(
+    "/items/",
+    response_model=ItemResponseSchema,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Items"]
+)
 async def create_item(item: ItemCreate):
     """Create a new item"""
-    collection = get_collection()
-    item_dict = item.model_dump()
-    result = await collection.insert_one(item_dict)
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
     
-    created_item = await collection.find_one({"_id": result.inserted_id})
-    created_item["_id"] = str(created_item["_id"])
-    
+    created_item = await crud.create(item)
     return created_item
 
 
-@app.get("/items/", response_model=List[ItemResponse], tags=["Items"])
-async def get_all_items(skip: int = 0, limit: int = 100):
+@app.get("/items/", response_model=List[ItemResponseSchema], tags=["Items"])
+async def get_all_items(
+    skip: int = Query(0, ge=0, description="Number of items to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of items to return")
+):
     """Get all items with pagination"""
-    collection = get_collection()
-    items = []
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
     
-    cursor = collection.find().skip(skip).limit(limit)
-    async for document in cursor:
-        document["_id"] = str(document["_id"])
-        items.append(document)
-    
+    items, total = await crud.get_all(skip=skip, limit=limit)
     return items
 
 
-@app.get("/items/{item_id}", response_model=ItemResponse, tags=["Items"])
+@app.get("/items/search/", response_model=List[ItemResponseSchema], tags=["Items"])
+async def search_items(
+    q: str = Query(..., min_length=1, description="Search term"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000)
+):
+    """Search items by name or description"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    items, total = await crud.search(q, skip=skip, limit=limit)
+    return items
+
+
+@app.get("/items/category/{category}", response_model=List[ItemResponseSchema], tags=["Items"])
+async def get_items_by_category(
+    category: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000)
+):
+    """Get items by category"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    items, total = await crud.get_by_category(category, skip=skip, limit=limit)
+    return items
+
+
+@app.get("/items/active/", response_model=List[ItemResponseSchema], tags=["Items"])
+async def get_active_items(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000)
+):
+    """Get only active items"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    items, total = await crud.get_active_items(skip=skip, limit=limit)
+    return items
+
+
+@app.get("/items/low-stock/", response_model=List[ItemResponseSchema], tags=["Items"])
+async def get_low_stock_items(
+    threshold: int = Query(5, ge=0, description="Stock threshold")
+):
+    """Get items with low stock"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    items = await crud.get_low_stock_items(threshold=threshold)
+    return items
+
+
+@app.get("/items/{item_id}", response_model=ItemResponseSchema, tags=["Items"])
 async def get_item(item_id: str):
     """Get a single item by ID"""
-    if not ObjectId.is_valid(item_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid item ID format"
-        )
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
     
-    collection = get_collection()
-    item = await collection.find_one({"_id": ObjectId(item_id)})
+    item = await crud.get_by_id(item_id)
     
     if not item:
         raise HTTPException(
@@ -148,60 +163,39 @@ async def get_item(item_id: str):
             detail=f"Item with id {item_id} not found"
         )
     
-    item["_id"] = str(item["_id"])
     return item
 
 
-@app.put("/items/{item_id}", response_model=ItemResponse, tags=["Items"])
+@app.put("/items/{item_id}", response_model=ItemResponseSchema, tags=["Items"])
 async def update_item(item_id: str, item_update: ItemUpdate):
     """Update an existing item"""
-    if not ObjectId.is_valid(item_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid item ID format"
-        )
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
     
-    collection = get_collection()
+    updated_item = await crud.update(item_id, item_update)
     
-    # Remove None values from update
-    update_data = {k: v for k, v in item_update.model_dump().items() if v is not None}
-    
-    if not update_data:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid fields to update"
-        )
-    
-    result = await collection.update_one(
-        {"_id": ObjectId(item_id)},
-        {"$set": update_data}
-    )
-    
-    if result.matched_count == 0:
+    if not updated_item:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Item with id {item_id} not found"
+            detail=f"Item with id {item_id} not found or no valid fields to update"
         )
-    
-    updated_item = await collection.find_one({"_id": ObjectId(item_id)})
-    updated_item["_id"] = str(updated_item["_id"])
     
     return updated_item
 
 
-@app.delete("/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Items"])
+@app.delete(
+    "/items/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Items"]
+)
 async def delete_item(item_id: str):
-    """Delete an item"""
-    if not ObjectId.is_valid(item_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid item ID format"
-        )
+    """Permanently delete an item"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
     
-    collection = get_collection()
-    result = await collection.delete_one({"_id": ObjectId(item_id)})
+    deleted = await crud.delete(item_id)
     
-    if result.deleted_count == 0:
+    if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Item with id {item_id} not found"
@@ -210,14 +204,47 @@ async def delete_item(item_id: str):
     return None
 
 
-@app.get("/health", tags=["Health"])
-async def health_check():
-    """Check if the API and database are running"""
-    try:
-        await db_client.admin.command('ping')
-        return {"status": "healthy", "database": "connected"}
-    except Exception as e:
+@app.patch("/items/{item_id}/deactivate", response_model=ItemResponseSchema, tags=["Items"])
+async def deactivate_item(item_id: str):
+    """Soft delete (deactivate) an item"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    item = await crud.soft_delete(item_id)
+    
+    if not item:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Database connection failed: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with id {item_id} not found"
         )
+    
+    return item
+
+
+@app.get("/stats/total-value", tags=["Statistics"])
+async def get_total_inventory_value():
+    """Get total inventory value"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    total_value = await crud.get_total_value()
+    
+    return {
+        "total_inventory_value": round(total_value, 2),
+        "currency": "USD"
+    }
+
+
+@app.post("/items/bulk/update-prices", tags=["Bulk Operations"])
+async def bulk_update_prices(multiplier: float = Query(..., gt=0, description="Price multiplier")):
+    """Bulk update all item prices"""
+    collection = await get_collection()
+    crud = CRUDOperations(collection)
+    
+    modified_count = await crud.bulk_update_prices(multiplier)
+    
+    return {
+        "message": f"Successfully updated {modified_count} items",
+        "modified_count": modified_count,
+        "multiplier": multiplier
+    }
